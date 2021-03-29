@@ -25,6 +25,7 @@ from __future__ import division
 from __future__ import print_function
 
 import functools
+import itertools
 import os
 import random
 import re
@@ -280,6 +281,192 @@ def variable_filter_max_size(v, max_size=1e7):
   return v.size <= max_size
 
 
+def _build_ckpt_to_local_var_name_mapping(
+    ckpt_num_blocks, ckpt_num_layers, local_num_blocks,
+    local_num_layers, new_layers, regex_prefix=None):
+  """Builds a mapping from checkpoint variable names to local variable names.
+
+  Args:
+    ckpt_num_blocks: an integer, number of blocks in checkpoint.
+    ckpt_num_layers: an integer, number of layers in checkpoint.
+    local_num_blocks: an integer, number of blocks in current model.
+    local_num_layers: an integer, number of layers in current model.
+    new_layers: a list of lists, specifying new layer indices in the current
+      model not present in the ckpt.
+    regex_prefix: optional, a string, specifying a prefix to match for
+      both checkpoint variables and ones in the current model.
+
+  Returns:
+    a dictionary where keys are checkpoint variable name regexes and
+    values are local variable name regexes. It specifies the mapping between
+    the checkpoint block/layer group and local block/layer group.
+  """
+  def build_regex(layer_num, block_num, num_blocks):
+    base_regex = r"layer_{:0=3d}".format(layer_num)
+    if num_blocks is not None:
+      base_regex = r"block_{:0=3d}/".format(block_num) + base_regex
+    if regex_prefix is not None:
+      base_regex = regex_prefix + r".*" + base_regex
+    return base_regex
+
+  all_ckpt_name_regexes = []
+  for block_num in range(ckpt_num_blocks or 1):
+    for layer_num in range(ckpt_num_layers):
+      all_ckpt_name_regexes.append(
+          build_regex(layer_num, block_num, ckpt_num_blocks))
+
+  all_local_name_regexes = []
+  for block_num in range(local_num_blocks or 1):
+    for layer_num in range(local_num_layers):
+      # Skip the new layers in the mapping ordering.
+      if (new_layers is not None) and (layer_num in new_layers): continue
+      all_local_name_regexes.append(
+          build_regex(layer_num, block_num, local_num_blocks))
+
+  if len(all_ckpt_name_regexes) != len(all_local_name_regexes):
+    raise ValueError("Invalid checkpoint to load. Number of variables in ckpt "
+                     "and current model (minus `new_layers`) must be equal.")
+
+  # Build a mapping from ckpt var regex to local var regex.
+  ckpt_var_name_to_local_var_name = {}
+  for ckpt_var_name, local_var_name in zip(
+      all_ckpt_name_regexes, all_local_name_regexes):
+    ckpt_var_name_to_local_var_name[ckpt_var_name] = local_var_name
+  return ckpt_var_name_to_local_var_name
+
+
+def _match_ckpt_to_local_var_name(
+    ckpt_var_name, local_var_name, ckpt_var_name_to_local_var_name):
+  """Returns True if this pair of vars should be loaded, False otherwise."""
+  # Name does not fall into the block/layer convention, so return identity.
+  # This will cover variable such as the global_step, embeddings, etc...
+  if "layer" not in ckpt_var_name or "layer" not in local_var_name:
+    return ckpt_var_name == local_var_name
+
+  # If the variable suffixes do not match they cannot be matched.
+  if ckpt_var_name.split("/")[-1] != local_var_name.split("/")[-1]:
+    return False
+
+  for ckpt_regex, var_regex in ckpt_var_name_to_local_var_name.items():
+    if (re.match(ckpt_regex, ckpt_var_name) and
+        re.match(var_regex, local_var_name)):
+      # Both ckpt and local var are the same layer/block group. Now check to
+      # see if its the same parameter in the layer/block group.
+      if ".*" in ckpt_regex:
+        ckpt_regex = ckpt_regex.split(".*")[1]
+      if ".*" in var_regex:
+        var_regex = var_regex.split(".*")[1]
+      if ckpt_var_name.replace(ckpt_regex, var_regex) == local_var_name:
+        return True
+  return False
+
+
+def _compute_num_blocks_and_layer(var_names):
+  """Takes list of variable names and outputs the max number of blocks/layers."""
+
+  encoder_decoder_model = any(
+      [re.match(r"^encoder/", var_name) for var_name in var_names])
+
+  def get_max_layer_or_block_num(regex, var_names):
+    matched_nums = [re.findall(regex, v) for v in var_names]
+    return max(
+        [int(num) + 1 for num in list(itertools.chain(*matched_nums))] + [-1])
+
+  if encoder_decoder_model:
+    enc_max_layer_num = get_max_layer_or_block_num(
+        r"encoder/.*layer_(\d{3})", var_names)
+    enc_max_block_num = get_max_layer_or_block_num(
+        r"encoder/.*block_(\d{3})", var_names)
+    dec_max_layer_num = get_max_layer_or_block_num(
+        r"decoder/.*layer_(\d{3})", var_names)
+    dec_max_block_num = get_max_layer_or_block_num(
+        r"decoder/.*block_(\d{3})", var_names)
+    max_layer_num = [enc_max_layer_num, dec_max_layer_num]
+    max_block_num = [enc_max_block_num, dec_max_block_num]
+  else:
+    max_layer_num = [get_max_layer_or_block_num(r"layer_(\d{3})", var_names)]
+    max_block_num = [get_max_layer_or_block_num(r"block_(\d{3})", var_names)]
+
+  max_block_num = [n if (n != -1) else None for n in max_block_num]
+  return max_block_num, max_layer_num
+
+
+@gin.configurable
+def flexible_ckpt_init(ckpt_path, new_layers=None):
+  """More flexibly handles loading a checkpoint.
+
+  Covers three common cases when initializing a checkpoint:
+  (1) Loading a checkpoint that contains different block/layer numbering.
+  (2) Inserting new layers in into the current model that should not be loaded
+      from the checkpoint (e.g. inserting an extra DenseReLUDense layer in each
+      block group for the current model).
+  (3) Changing the layer type from the ckpt in the current model
+      (e.g. replacing a DenseReLUDense layer with an MoE1D layer).
+
+  Args:
+    ckpt_path: string, saved checkpoint path to load.
+    new_layers: optional list of lists specifing what numbers in the layer stack
+      are newly added in the current model. These should be skipped when loading
+      the checkpoint weights. If Enc-Dec model the list will contains two lists,
+      one for new encoder layers and the other for decoder layer
+      (e.g. [[3], [1]]). If LM then just a single list (e.g. [[3]]).
+  """
+  tf.logging.info("Using flexible chkpt init. new_layers: {}".format(
+      new_layers))
+  ckpt_var_names = [v for v, _ in tf.train.list_variables(ckpt_path)]
+  local_vars = {v.op.name: v for v in tf.global_variables()}
+  tf.logging.info("ckpt_var_names: {}".format(ckpt_var_names))
+  local_var_names = local_vars.keys()
+  tf.logging.info("local_var_names: {}".format(local_var_names))
+
+  # `num_blocks` and `num_layers` will be tuples of length two for
+  # encoder-decoder models and length 1 for LMs.
+  ckpt_num_blocks, ckpt_num_layers = _compute_num_blocks_and_layer(
+      ckpt_var_names)
+  local_num_blocks, local_num_layers = _compute_num_blocks_and_layer(
+      local_var_names)
+
+  # Create regex mapping from ckpt variable names to local variable names.
+  mappings = []
+  if len(ckpt_num_blocks) == 2:
+    # Encoder-Decoder Model.
+    new_enc_layers, new_dec_layers = None, None
+    if new_layers is not None:
+      new_enc_layers, new_dec_layers = new_layers
+    enc_mapping = _build_ckpt_to_local_var_name_mapping(
+        ckpt_num_blocks[0], ckpt_num_layers[0], local_num_blocks[0],
+        local_num_layers[0], new_enc_layers, regex_prefix="encoder/")
+    dec_mapping = _build_ckpt_to_local_var_name_mapping(
+        ckpt_num_blocks[1], ckpt_num_layers[1], local_num_blocks[1],
+        local_num_layers[1], new_dec_layers, regex_prefix="decoder/")
+    mappings = [enc_mapping, dec_mapping]
+  else:
+    # LM Model.
+    new_lm_layers = None
+    if new_layers is not None:
+      new_lm_layers = new_layers[0]
+    lm_mapping = _build_ckpt_to_local_var_name_mapping(
+        ckpt_num_blocks[0], ckpt_num_layers[0], local_num_blocks[0],
+        local_num_layers[0], new_lm_layers)
+    mappings = [lm_mapping]
+
+  init_ckpt_mapping = {}
+  for ckpt_var_name in ckpt_var_names:
+    for local_var_name, local_var in local_vars.items():
+      for mapping in mappings:
+        if _match_ckpt_to_local_var_name(
+            ckpt_var_name, local_var_name, mapping):
+          init_ckpt_mapping[ckpt_var_name] = local_var
+
+  tf.logging.info("Variables being loaded from ckpt: {}".format(
+      init_ckpt_mapping.keys()))
+  tf.logging.info("Variables not being loaded from ckpt: {}".format(
+      set(ckpt_var_names) - set(init_ckpt_mapping.keys())))
+  tf.logging.info("Variables not being initialized from ckpt: {}".format(
+      set(local_vars.values()) - set(init_ckpt_mapping.values())))
+  tf.train.init_from_checkpoint(ckpt_path, init_ckpt_mapping)
+
+
 @gin.configurable(denylist=["predict_fn"])  # pass `predict_fn` through `run`
 def tpu_estimator_model_fn(model_type,
                            transformer_model,
@@ -301,6 +488,7 @@ def tpu_estimator_model_fn(model_type,
                            score_in_predict_mode=False,
                            variable_filter=None,
                            init_checkpoint=None,
+                           use_flexible_ckpt_loading=False,
                            init_variable_filter="",
                            ensemble_inputs=None,
                            mesh_devices=None,
@@ -342,6 +530,11 @@ def tpu_estimator_model_fn(model_type,
     init_checkpoint: a string, if not None then read in variables from this
       checkpoint path when initializing variables. Will only initialize
       variables that appear both in the current graph and the checkpoint.
+    use_flexible_ckpt_loading: a boolean, specifies whether to use the
+      flexible checkpoint loading function. This allows for loading ckpts with
+      (1) different block/layer numberings, (2) loading partial model weights
+      when new layers are added in current model (3) changing the layer type
+      from the ckpt to the current model and skipping it when loading.
     init_variable_filter: a string, used only when init_checkpoint is set.
       controls which variables are loaded from the checkpoint using regex.
       if empty string (default), all variables from the checkpoint are loaded.
@@ -731,30 +924,35 @@ def tpu_estimator_model_fn(model_type,
         host_call = None
 
       with mtf.utils.outside_all_rewrites():
-
+        tf.logging.info("init_checkpoint: {}".format(init_checkpoint))
         if init_checkpoint:
-          ckpt_vars = {v for v, _ in tf.train.list_variables(init_checkpoint)}
+          if use_flexible_ckpt_loading:
+            flexible_ckpt_init(init_checkpoint)
+          else:
+            ckpt_vars = {v for v, _ in tf.train.list_variables(init_checkpoint)}
 
-          if init_variable_filter:
-            pattern = re.compile(init_variable_filter)
-            ckpt_vars = {v for v in ckpt_vars if pattern.search(v)}
+            if init_variable_filter:
+              pattern = re.compile(init_variable_filter)
+              ckpt_vars = {v for v in ckpt_vars if pattern.search(v)}
 
-          global_vars = {v.op.name for v in tf.global_variables()}
-          restore_vars = {
-              v for v in global_vars if init_checkpoint_variable_mapping(v)
-              in ckpt_vars}
-          tf.logging.info("Initializing variables from %s:", init_checkpoint)
-          tf.logging.debug("\n".join(sorted(restore_vars)))
-          tf.logging.info("Variables in %s but not in graph:", init_checkpoint)
-          tf.logging.info("\n".join(sorted(
-              ckpt_vars -
-              {init_checkpoint_variable_mapping(v) for v in global_vars})))
-          tf.logging.info("Variables in graph but not in %s:", init_checkpoint)
-          tf.logging.info("\n".join(sorted(global_vars - restore_vars)))
-          tf.train.init_from_checkpoint(
-              init_checkpoint,
-              {init_checkpoint_variable_mapping(v): v for v in restore_vars}
-          )
+            global_vars = {v.op.name for v in tf.global_variables()}
+            restore_vars = {
+                v for v in global_vars if init_checkpoint_variable_mapping(v)
+                in ckpt_vars}
+            tf.logging.info("Initializing variables from %s:", init_checkpoint)
+            tf.logging.debug("\n".join(sorted(restore_vars)))
+            tf.logging.info("Variables in %s but not in graph:",
+                            init_checkpoint)
+            tf.logging.info("\n".join(sorted(
+                ckpt_vars -
+                {init_checkpoint_variable_mapping(v) for v in global_vars})))
+            tf.logging.info("Variables in graph but not in %s:",
+                            init_checkpoint)
+            tf.logging.info("\n".join(sorted(global_vars - restore_vars)))
+            tf.train.init_from_checkpoint(
+                init_checkpoint,
+                {init_checkpoint_variable_mapping(v): v for v in restore_vars}
+            )
 
         # Copy master variables to slices. Must be called first.
         restore_hook = mtf.MtfRestoreHook(lowering)
